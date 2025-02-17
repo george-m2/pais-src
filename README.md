@@ -1,2 +1,2 @@
 # pais-src
-Repository mirror for graphs and notebooks used in my university essays.
+Repository mirror for graphs, notebooks and data used in PAIS university essays.
