@@ -1,0 +1,548 @@
+---
+title: "QCA Analysis of Democratic Erosion Relative to Populist Movements in Europe (2000-2020)"
+author: "George Maycock"
+date: "`r Sys.Date()`"
+output: rmarkdown::github_document
+---
+
+This notebook performs Qualitative Comparative Analysis (QCA) to explore the conditions associated with democratic erosion in a set of European countries between 2000 and 2020.
+
+## 1. Setup
+### Libraries
+
+```{r load-libs, message=FALSE, warning=FALSE}
+# install.packages(c("QCA", "SetMethods", "tidyverse", "vdemdata", "countrycode"))
+library(QCA)
+library(SetMethods)
+library(tidyverse)
+library(vdemdata)
+library(countrycode)
+```
+
+Next, we define the core parameters for the analysis: the countries included (cases), the overall time period, and specific time windows for calculating the outcome variable.
+This outcome is defined as democratic erosion based on the V-Dem Liberal Democracy Index.
+
+```{r define-parameters}
+case_countries <- c("Austria", "Belgium", "Czech Republic", "Denmark", "France",
+                    "Greece", "Hungary", "Italy", "Netherlands", "Poland",
+                    "Slovakia", "Spain", "Sweden", "Switzerland", "United Kingdom")
+
+start_year_period <- 2000
+end_year_period <- 2020
+start_years_ldi_start <- 2000:2002 # Start period for LDI baseline
+end_years_ldi_end <- 2018:2020   # End period
+```
+
+We load World Bank external data for the Gini coefficient, which will be used as one of the conditions.
+
+```{r load-gini}
+gini_file <- "src/gini.csv"
+if (!file.exists(gini_file)) stop("Gini data file not found at: ", gini_file)
+gini_raw <- read_csv(gini_file, show_col_types = FALSE)
+```
+
+Now, we load the comprehensive V-Dem dataset from vdemdata::vdem
+
+```{r load-vdem, message=TRUE}
+cat("Loading V-Dem data...\n")
+vdem_full <- tryCatch({ vdemdata::vdem }, error = function(e) {
+    stop("Failed to load V-Dem data. Error: ", e$message)
+})
+cat("V-Dem data loaded.\n")
+```
+
+## 2. Data cleaning
+
+We begin by standardising the country names to ensure consistency between different data sources (V-Dem/ WB Gini dataset)
+
+```{r standardize-countries, warning=TRUE}
+case_countries_std <- countrycode(case_countries, origin = 'country.name', destination = 'country.name')
+
+# Handle potential NAs from countrycode conversion
+if(any(is.na(case_countries_std))) {
+  failed_countries <- case_countries[is.na(case_countries_std)]
+  warning("Could not standardise names for: ", paste(failed_countries, collapse=", "), ". These countries will be excluded if standardisation failed.")
+  case_countries_std <- case_countries_std[!is.na(case_countries_std)] # keep only successfully standardised names
+}
+if(length(case_countries_std) == 0) stop("No case countries could be standardized.")
+
+print(case_countries_std)
+
+# Create a tibble to hold data for our cases
+country_data <- tibble(country_name_std = case_countries_std)
+```
+
+### 2a. Calculate EROSION outcome
+
+The outcome variable, `EROSION`, measures the degree of democratic erosion. We operationalise this as the difference in the V-Dem Liberal Democracy Index (`v2x_libdem`) between an early period (average of 2000-2002) and a later period (average of 2018-2020). A higher score indicates greater erosion (a larger drop in the LDI).
+
+```{r calc-outcome-erosion}
+cat("Calculating EROSION...\n")
+ldi_data <- vdem_full %>%
+  filter(year >= min(start_years_ldi_start) & year <= max(end_years_ldi_end)) %>% # flter years 
+  mutate(country_name_std = countrycode(country_name, origin = 'country.name', destination = 'country.name')) %>% # mutate and standardise country names
+  filter(country_name_std %in% case_countries_std, !is.na(country_name_std)) %>% # filter countries
+  select(country_name_std, year, LDI = v2x_libdem) %>%
+  na.omit()
+
+# Average LDI at the start period
+ldi_start_avg <- ldi_data %>%
+  filter(year %in% start_years_ldi_start) %>%
+  group_by(country_name_std) %>%
+  summarise(LDI_start = mean(LDI, na.rm = TRUE), n_start = n(), .groups = "drop")
+
+# End period
+ldi_end_avg <- ldi_data %>%
+  filter(year %in% end_years_ldi_end) %>%
+  group_by(country_name_std) %>%
+  summarise(LDI_end = mean(LDI, na.rm = TRUE), n_end = n(), .groups = "drop")
+
+# raw erosion score (start LDI - end LDI)
+erosion_calc <- ldi_start_avg %>%
+  inner_join(ldi_end_avg, by = "country_name_std") %>%
+  filter(n_start > 0, n_end > 0) %>% # does data exist for both periods?
+  mutate(EROSION_raw = LDI_start - LDI_end) %>% # higher score, greater degree of erosion
+  select(country_name_std, EROSION_raw)
+
+# Add erosion score to dataset
+country_data <- country_data %>% left_join(erosion_calc, by = "country_name_std")
+cat("Outcome variable 'EROSION_raw' calculated.\n")
+```
+
+### 2b. Calculate conditions
+
+Now we calculate the potential explanatory conditions for democratic erosion. These are averaged over the full period (2000-2020).
+
+#### Condition 1: INST 
+
+This condition represents the strength of legislative constraints on the executive, using `v2xlg_legcon` and averaged over the period for each country. 
+Higher values indicate stronger constraints
+
+```{r calc-cond-inst}
+cat("Calculating INST...\n")
+inst_constraints <- vdem_full %>%
+  filter(year >= start_year_period & year <= end_year_period) %>%
+  mutate(country_name_std = countrycode(country_name, origin = 'country.name', destination = 'country.name')) %>%
+  filter(country_name_std %in% case_countries_std, !is.na(country_name_std)) %>%
+  group_by(country_name_std) %>%
+  summarise(INST_raw = mean(v2xlg_legcon, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.nan(INST_raw)) # remove NaN countries
+country_data <- country_data %>% left_join(inst_constraints, by = "country_name_std")
+cat("Condition 'INST_raw' calculated.\n")
+```
+
+#### Condition 2: GINI 
+
+Average Gini coefficient over the period for each country.
+
+```{r calc-cond-gini, warning=FALSE}
+# suppress warnings from countrycode here as we handle NAs later
+cat("Calculating: GINI...\n")
+gini_avg <- gini_raw %>%
+  select(country_raw = Entity, year = Year, gini = `Gini coefficient`) %>%
+  filter(year >= start_year_period & year <= end_year_period) %>%
+  mutate(country_name_std = suppressWarnings(countrycode(country_raw, origin = 'country.name', destination = 'country.name'))) %>%
+  filter(country_name_std %in% case_countries_std, !is.na(country_name_std)) %>%
+  group_by(country_name_std) %>%
+  summarise(GINI_raw = mean(gini, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.nan(GINI_raw)) 
+country_data <- country_data %>% left_join(gini_avg, by = "country_name_std")
+cat("Condition 'GINI_raw' calculated.\n")
+```
+
+#### Condition 3: POL
+
+Degree of political polarisation, derived from `v2cacamps` and averaged over the period. Higher values indicate greater polarisation.
+
+```{r calc-cond-pol}
+cat("Calculating: POL...\n")
+polarisation <- vdem_full %>%
+  filter(year >= start_year_period & year <= end_year_period) %>%
+  mutate(country_name_std = countrycode(country_name, origin = 'country.name', destination = 'country.name')) %>%
+  filter(country_name_std %in% case_countries_std, !is.na(country_name_std)) %>%
+  group_by(country_name_std) %>%
+  summarise(POL_raw = mean(v2cacamps, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.nan(POL_raw)) 
+country_data <- country_data %>% left_join(polarisation, by = "country_name_std")
+cat("Condition 'POL_raw' calculated.\n")
+```
+
+#### Condition 4: JUDATTACK_comp 
+
+This condition aims to capture the extent to which the judiciary is undermined or attacked. It's a compound index created from several V-Dem variables:
+*   `v2juhcind`: High court independence (inverted)
+*   `v2juncind`: Lower court independence (inverted)
+*   `v2jucomp`: Judicial compliance with the executive (inverted)
+*   `v2jupoatck`: Government attacks on the judiciary (rescaled 0-1)
+
+We invert the independence/compliance variables so that higher scores mean *less* independence/compliance. We rescale the attack variable to 0-1 (higher = more attacks). The final score is the average of these four transformed components, averaged over the period 2000-2020.
+
+```{r calc-cond-judattack, warning=TRUE}
+cat("Calculating 'JUDATTACK_comp_raw'...\n")
+
+judicial_vars <- c("v2juhcind", "v2juncind", "v2jucomp", "v2jupoatck")
+
+# Filter data and prepare components
+vdem_filtered_jud <- vdem_full %>%
+  filter(year >= start_year_period & year <= end_year_period) %>%
+  mutate(country_name_std = countrycode(country_name, origin = 'country.name', destination = 'country.name')) %>%
+  filter(country_name_std %in% case_countries_std, !is.na(country_name_std)) %>%
+  select(country_name_std, year, all_of(judicial_vars)) %>%
+  # Remove rows where *any* of the selected judicial variables are NA for a given year
+  na.omit()
+
+# Check if data remains after NA removal
+if (nrow(vdem_filtered_jud) == 0) {
+    warning("No complete judicial data found for the specified countries and years after removing NAs. Skipping JUDATTACK_comp.")
+    country_data$JUDATTACK_comp_raw <- NA_real_ 
+} else {
+    # Find observed min/max for v2jupoatck for rescaling
+    actual_min_jupoatck <- min(vdem_filtered_jud$v2jupoatck, na.rm = TRUE)
+    actual_max_jupoatck <- max(vdem_filtered_jud$v2jupoatck, na.rm = TRUE)
+    cat(paste0("Observed range for v2jupoatck (Govt Attacks): [",
+               round(actual_min_jupoatck, 2), ", ", round(actual_max_jupoatck, 2), "]\n"))
+    # If min == max, rescaling is impossible. Add a small epsilon to max.
+    if (actual_max_jupoatck == actual_min_jupoatck) {
+        actual_max_jupoatck <- actual_max_jupoatck + 1e-6
+        warning("Min and Max of v2jupoatck are identical. Added epsilon for rescaling.")
+    }
+
+    # Transform variables: invert independence/compliance, rescale attacks
+    judicial_transformed <- vdem_filtered_jud %>%
+      mutate(
+        # Invert independence and compliance (higher score = WORSE situation)
+        inv_v2juhcind = 1 - v2juhcind,
+        inv_v2juncind = 1 - v2juncind,
+        inv_v2jucomp = 1 - v2jucomp,
+        # Rescale v2jupoatck to 0-1 (higher score = worse situation)
+        # ...clamp between 0 and 1
+        rescaled_v2jupoatck = (v2jupoatck - actual_min_jupoatck) / (actual_max_jupoatck - actual_min_jupoatck),
+        rescaled_v2jupoatck = pmax(0, pmin(1, rescaled_v2jupoatck)) # Ensure strictly within [0, 1]
+      ) %>%
+      select(country_name_std, year, starts_with("inv_"), starts_with("rescaled_"))
+
+    # Calculate the average of each transformed component over the period for each country
+    judicial_compound_avg <- judicial_transformed %>%
+      group_by(country_name_std) %>%
+      summarise(
+        mean_inv_juhcind = mean(inv_v2juhcind, na.rm = TRUE),
+        mean_inv_juncind = mean(inv_v2juncind, na.rm = TRUE),
+        mean_inv_jucomp = mean(inv_v2jucomp, na.rm = TRUE),
+        mean_rescaled_jupoatck = mean(rescaled_v2jupoatck, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      # Calculate the final compound score by averaging the means of the components
+      rowwise() %>%
+      mutate(JUDATTACK_comp_raw = mean(c(mean_inv_juhcind, mean_inv_juncind, mean_inv_jucomp, mean_rescaled_jupoatck), na.rm = TRUE)) %>%
+      ungroup() %>%
+      select(country_name_std, JUDATTACK_comp_raw) %>%
+      filter(!is.nan(JUDATTACK_comp_raw)) # Ensure final score is not NaN
+
+    # Join the compound score back to the main data
+    country_data <- country_data %>% left_join(judicial_compound_avg, by = "country_name_std")
+    cat("Condition 'JUDATTACK_comp_raw' calculated.\n")
+}
+```
+
+## 3. Final Data Preparation & Calibration
+
+We now consolidate the calculated outcome and conditions into a final dataset for QCA. We remove any countries (cases) that have missing values (`NA`) for any of the selected variables.
+
+```{r finalize-data, warning=TRUE}
+# Select the final set of raw variables for QCA
+qca_final_cs <- country_data %>%
+  select(country_name_std, EROSION_raw, INST_raw, GINI_raw, POL_raw, JUDATTACK_comp_raw) %>%
+  na.omit() # Remove rows with NA in *any* selected column
+
+# Report dropped countries and final N
+dropped_countries <- setdiff(case_countries_std, qca_final_cs$country_name_std)
+if (length(dropped_countries) > 0) {
+    cat("Warning: Countries dropped due to missing values in outcome or conditions:\n", paste(dropped_countries, collapse=", "), "\n")
+}
+cat(sprintf("Initial countries: %d. Countries remaining after removing NAs: %d.\n", length(case_countries_std), nrow(qca_final_cs)))
+
+# Are there enough cases?
+if (nrow(qca_final_cs) == 0) stop("No complete cases remaining.")
+if (nrow(qca_final_cs) < 5) warning("Only ", nrow(qca_final_cs), " cases remain. QCA results may be unreliable.")
+
+# Prepare for calibration (remove country name, set as rownames)
+# Suppress warning about rownames on tibble, it's expected here and will shout about depreciation, but works for QCA package
+qca_final_cs_for_calib <- suppressWarnings({
+  df_temp <- qca_final_cs %>% select(-country_name_std)
+  rownames(df_temp) <- qca_final_cs$country_name_std
+  df_temp
+})
+
+
+cat("\nFinal raw data for calibration:\n")
+print(qca_final_cs_for_calib)
+```
+
+### Calibration
+https://bookdown.org/dusadrian/QCAbook/calibration.html
+
+(fs)QCA requires variables to be calibrated into set memberships (ranging from 0 to 1). We use the direct method of calibration with three qualitative anchors: full non-membership (0.05), the crossover point (0.50), and full membership (0.95). We estimate these anchors using quantiles of the raw data distribution (specifically, the 25th, 50th, and 75th percentiles, with fallbacks for variables with low variation).
+```{r define-calibration-function, warning=FALSE}
+# quantile-based thresholds
+get_thresholds_string <- function(x, name = deparse(substitute(x)), probs = c(0.25, 0.5, 0.75), na.rm = TRUE) { 
+    var_name <- name; unique_vals <- unique(na.omit(x)); quant_probs_labels <- paste0(probs * 100, "%") # "25% 50% 75%"
+    if (length(unique_vals) < 3) {
+        # Handle variables with very few unique values
+        warning(paste0("Variable '", var_name, "' has < 3 unique values. Using min/median/max for thresholds."), call. = FALSE)
+        q <- quantile(x, probs = c(0, 0.5, 1), na.rm = na.rm, type = 8); quant_probs_labels <- c("Min", "Median", "Max") # 0% 50% 100%
+        sd_x <- sd(x, na.rm=TRUE); if (is.na(sd_x) || sd_x == 0) sd_x <- 1e-6 # Avoid division by zero SD 
+        # Ensure thresholds are distinct, adding small noise if needed
+        if(q[1]==q[2] && q[2]==q[3]) { q[1] <- q[1] - 1e-9; q[3] <- q[3] + 1e-9}
+        else {
+           if (q[3] <= q[2]) q[3] <- q[2] + sd_x * 0.01 + 1e-9
+           if (q[2] <= q[1]) q[1] <- q[2] - sd_x * 0.01 - 1e-9
+        }
+         # Fallback if initial adjustment failed
+         if(q[1] >= q[2] || q[2] >= q[3]) {
+             q <- sort(quantile(x, probs=c(0.1, 0.5, 0.9), na.rm=TRUE, type=8)); quant_probs_labels <- c("10%", "50%", "90%")
+             if(length(unique(q))<3) q <- c(min(x, na.rm=T), median(x, na.rm=T), max(x, na.rm=T)); quant_probs_labels <- c("Min", "Median", "Max")
+             if (q[3] <= q[2]) q[3] <- q[2] + 1e-9
+             if (q[2] <= q[1]) q[1] <- q[2] - 1e-9
+             if(q[1] == q[2] && q[2] == q[3]) { q[1] <- q[1] - 1e-9; q[3] <- q[3] + 1e-9}
+         }
+    } else {
+        # Standard case: use specified quantiles
+        q <- quantile(x, probs = probs, na.rm = na.rm, type = 8)
+        sd_x <- sd(x, na.rm=TRUE); if (is.na(sd_x) || sd_x == 0) sd_x <- 1e-6
+        # Ensure thresholds are distinct
+        if (q[3] <= q[2]) q[3] <- q[2] + sd_x*0.01 + 1e-9
+        if (q[2] <= q[1]) q[1] <- q[2] - sd_x*0.01 - 1e-9
+        # Fallback if adjustment failed
+        if(q[1] >= q[2] || q[2] >= q[3]){
+             warning(paste0("Could not ensure distinct quantile thresholds for '", var_name, "'. Using 10/50/90 percentiles as fallback."), call.=FALSE)
+             q <- sort(quantile(x, probs=c(0.1, 0.5, 0.9), na.rm=TRUE, type=8)); quant_probs_labels <- c("10%", "50%", "90%")
+             if(length(unique(q))<3) q <- c(min(x, na.rm=T), median(x, na.rm=T), max(x, na.rm=T)); quant_probs_labels <- c("Min", "Median", "Max")
+             if (q[3] <= q[2]) q[3] <- q[2] + 1e-9
+             if (q[2] <= q[1]) q[1] <- q[2] - 1e-9
+             if(q[1] == q[2] && q[2] == q[3]) { q[1] <- q[1] - 1e-9; q[3] <- q[3] + 1e-9}
+        }
+    }
+    # Format thresholds as string "full_membership,crossover,full_non_membership"
+    thresholds_str <- paste(format(q[3], digits = 3, nsmall=3), format(q[2], digits = 3, nsmall=3), format(q[1], digits = 3, nsmall=3), sep = ",")
+    cat(var_name, "Calibration thresholds (", paste0(quant_probs_labels, collapse="/"), " for full_memb/cross/non_memb):", thresholds_str, "\n")
+    return(thresholds_str)
+}
+```
+
+Now we apply the QCA calibration function to each raw variable to generate fuzzy set scores. 
+
+```{r apply-calibration, warning=TRUE}
+cat("--- Calibrating Data ---\n")
+qca_calibrated_data_cs <- qca_final_cs_for_calib
+
+# EROSION
+qca_calibrated_data_cs$fEROSION <- calibrate(qca_calibrated_data_cs$EROSION_raw, type = "fuzzy", thresholds = get_thresholds_string(qca_calibrated_data_cs$EROSION_raw, name="EROSION_raw"))
+
+# Calibrate conditions
+qca_calibrated_data_cs$fINST <- calibrate(qca_calibrated_data_cs$INST_raw, type = "fuzzy", thresholds = get_thresholds_string(qca_calibrated_data_cs$INST_raw, name="INST_raw"))
+qca_calibrated_data_cs$fGINI <- calibrate(qca_calibrated_data_cs$GINI_raw, type = "fuzzy", thresholds = get_thresholds_string(qca_calibrated_data_cs$GINI_raw, name="GINI_raw"))
+qca_calibrated_data_cs$fPOL <- calibrate(qca_calibrated_data_cs$POL_raw, type = "fuzzy", thresholds = get_thresholds_string(qca_calibrated_data_cs$POL_raw, name="POL_raw"))
+qca_calibrated_data_cs$fJUDATTACK_comp <- calibrate(qca_calibrated_data_cs$JUDATTACK_comp_raw, type = "fuzzy", thresholds = get_thresholds_string(qca_calibrated_data_cs$JUDATTACK_comp_raw, name="JUDATTACK_comp_raw"))
+
+# Define the final set of *calibrated* conditions used in the analysis
+conditions_cs <- c("fINST", "fGINI", "fPOL", "fJUDATTACK_comp")
+
+# Select final calibrated columns
+qca_calibrated_data_cs_final <- qca_calibrated_data_cs %>% select(starts_with("f"))
+
+print("Summary of final calibrated data:")
+print(summary(qca_calibrated_data_cs_final))
+
+# Convert to df and ensure rownames are set for QCA functions
+qca_calibrated_data_cs_df <- as.data.frame(qca_calibrated_data_cs_final)
+rownames(qca_calibrated_data_cs_df) <- rownames(qca_final_cs_for_calib)
+```
+
+## 4. QCA analysis (Cross-Sectional)
+
+With the data calibrated, we proceed to the QCA analysis, starting with the analysis of necessity.
+
+```{r check-cases-before-qca}
+cat("--- QCA Analysis ---\n")
+if (nrow(qca_calibrated_data_cs_df) < 5) stop("Too few valid cases remaining for QCA analysis.")
+```
+
+### 4a. Necessity analysis
+
+We test whether any individual condition (or its absence) is necessary for the outcome (democratic erosion, `fEROSION`) or its absence (`~fEROSION`). We use an inclusion threshold (`incl.cut`) of 0.9 and a coverage threshold (`cov.cut`) of 0.5.
+
+```{r qca-necessity, message=FALSE}
+cat("--- Necessity Analysis for fEROSION ---\n")
+# Check if outcome exists and has variation before proceeding
+if (!"fEROSION" %in% names(qca_calibrated_data_cs_df) || var(qca_calibrated_data_cs_df$fEROSION, na.rm=TRUE) == 0) {
+    cat("Skipping Necessity for fEROSION: Outcome missing or has no variation.\n")
+} else {
+    necessity_results_cs <- tryCatch(
+        superSubset(qca_calibrated_data_cs_df, outcome = "fEROSION", incl.cut = 0.9, cov.cut = 0.5, relation = "necessity", conditions = conditions_cs), # calculate necessity
+        error = function(e) { cat("Error in Necessity Analysis for fEROSION:", e$message, "\n"); NULL }
+    )
+    if (!is.null(necessity_results_cs) && nrow(necessity_results_cs$incl.cov) > 0) {
+        print(necessity_results_cs)
+    } else {
+        cat("No necessary conditions found for fEROSION (Incl. >= 0.9, Cov >= 0.5).\n")
+    }
+}
+
+cat("--- Necessity Analysis for Outcome ~fEROSION (Absence) ---\n")
+# negated outcome
+qca_calibrated_data_cs_df$negEROSION <- 1 - qca_calibrated_data_cs_df$fEROSION
+
+# Check if negated outcome exists and has variation
+if (!"negEROSION" %in% names(qca_calibrated_data_cs_df) || var(qca_calibrated_data_cs_df$negEROSION, na.rm=TRUE) == 0) {
+    cat("Skipping Necessity for ~fEROSION: Negated outcome missing or has no variation.\n")
+} else {
+    necessity_neg_results_cs <- tryCatch(
+        superSubset(qca_calibrated_data_cs_df, outcome = "negEROSION", incl.cut = 0.9, cov.cut = 0.5, relation = "necessity", conditions = conditions_cs),
+        error = function(e) { cat("Error in Necessity Analysis for ~fEROSION:", e$message, "\n"); NULL }
+    )
+    if (!is.null(necessity_neg_results_cs) && nrow(necessity_neg_results_cs$incl.cov) > 0) {
+        print(necessity_neg_results_cs)
+    } else {
+        cat("No necessary conditions found for ~fEROSION (Incl. >= 0.9, Cov >= 0.5).\n")
+    }
+}
+```
+
+### 4b. Sufficiency analysis
+
+Next, we perform the sufficiency analysis to identify combinations of conditions that are sufficient for the outcome (or its absence). We first generate a truth table and then minimize it to find the solution formulas. We use an inclusion threshold of 0.80 and require at least 1 case per configuration (`n.cut = 1`).
+
+#### Sufficiency for `fEROSION`
+
+```{r qca-sufficiency-erosion, message=FALSE}
+cat("--- Sufficiency Analysis for Outcome fEROSION ---\n")
+# Check if outcome exists and has variation
+if (!"fEROSION" %in% names(qca_calibrated_data_cs_df) || var(qca_calibrated_data_cs_df$fEROSION, na.rm=TRUE) == 0) {
+    cat("Skipping Sufficiency for fEROSION: Outcome missing or has no variation.\n")
+} else {
+    # Create Truth Table
+    tt_erosion <- tryCatch(
+        truthTable(qca_calibrated_data_cs_df, outcome = "fEROSION", conditions = conditions_cs,
+                   incl.cut = 0.80, n.cut = 1, show.cases = TRUE, sort.by = c("incl", "n"), decreasing = TRUE),
+        error = function(e) { cat("Error creating Truth Table for fEROSION:", e$message, "\n"); NULL }
+    )
+
+    if (!is.null(tt_erosion) && nrow(tt_erosion$tt) > 0) {
+        cat("\n--- Truth Table (fEROSION, Incl >= 0.80, N >= 1) ---\n")
+        print(tt_erosion)
+        cat("\n--- Solutions for Outcome fEROSION ---\n")
+
+        # Conservative solution (CS)
+        sol_c_erosion <- tryCatch(
+             minimize(tt_erosion, details = TRUE, method = "eQMC", show.cases = TRUE),
+             error = function(e) { cat("Error minimizing (Conservative) for fEROSION:", e$message, "\n"); NULL }
+        )
+        if (!is.null(sol_c_erosion)) {
+            cat("\n--- Conservative Solution (fEROSION) ---\n")
+            print(sol_c_erosion)
+        } else {
+             cat("Conservative solution could not be generated for fEROSION.\n")
+        }
+
+        # Parsimonious solution (PS)
+        sol_p_erosion <- tryCatch(
+             minimize(tt_erosion, details = TRUE, method = "eQMC", include = "?", show.cases = TRUE),
+             error = function(e) { cat("Error minimizing (Parsimonious) for fEROSION:", e$message, "\n"); NULL }
+        )
+        if (!is.null(sol_p_erosion)) {
+            cat("\n--- Parsimonious Solution (fEROSION) ---\n")
+            print(sol_p_erosion)
+        } else {
+            cat("Parsimonious solution could not be generated for fEROSION.\n")
+        }
+
+        # Intermediate Solution (Requires Theoretical Directional Expectations)
+        cat("\n--- Intermediate Solution (fEROSION - Requires dir.exp) ---\n")
+        cat("To generate the Intermediate Solution, define directional expectations ('dir.exp') based on theory.\n")
+        cat("Example: dir_exp_erosion <- c(fINST=\"0\", fGINI=\"1\", fPOL=\"1\", fJUDATTACK_comp=\"1\") # Expect erosion with low INST, high GINI, POL, JUDATTACK\n")
+        cat("# Then run: minimize(tt_erosion, details=TRUE, method=\"eQMC\", include=\"?\", dir.exp = dir_exp_erosion, show.cases=TRUE)\n")
+
+    } else {
+        cat("Skipping minimization for fEROSION: Truth table is empty or could not be generated (check inclusion/N cuts and data variation).\n")
+    }
+}
+```
+
+#### Sufficiency for `~fEROSION`
+
+Now we repeat the sufficiency analysis for the absence of democratic erosion (`negEROSION`).
+
+```{r qca-sufficiency-neg-erosion, message=FALSE}
+cat("--- Sufficiency Analysis for Outcome ~fEROSION ---\n")
+# Check if negated outcome exists and has variation
+if (!"negEROSION" %in% names(qca_calibrated_data_cs_df) || var(qca_calibrated_data_cs_df$negEROSION, na.rm=TRUE) == 0) {
+    cat("Skipping Sufficiency for ~fEROSION: Negated outcome missing or has no variation.\n")
+} else {
+    # Truth table calculation
+    tt_neg_erosion <- tryCatch(
+        truthTable(qca_calibrated_data_cs_df, outcome = "negEROSION", conditions = conditions_cs,
+                   incl.cut = 0.80, n.cut = 1, show.cases = TRUE, sort.by = c("incl", "n"), decreasing = TRUE),
+        error = function(e) { cat("Error creating Truth Table for ~fEROSION:", e$message, "\n"); NULL }
+    )
+
+    if (!is.null(tt_neg_erosion) && nrow(tt_neg_erosion$tt) > 0) {
+        cat("\n--- Truth Table (~fEROSION, Incl >= 0.80, N >= 1) ---\n")
+        print(tt_neg_erosion)
+        cat("\n--- Solutions for Outcome ~fEROSION ---\n")
+
+        # CS
+        sol_c_neg_erosion <- tryCatch(
+             minimize(tt_neg_erosion, details = TRUE, method = "eQMC", show.cases = TRUE),
+             error = function(e) { cat("Error minimizing (Conservative) for ~fEROSION:", e$message, "\n"); NULL }
+        )
+        if (!is.null(sol_c_neg_erosion)) {
+            cat("\n--- Conservative Solution (~fEROSION) ---\n")
+            print(sol_c_neg_erosion)
+        } else {
+            cat("Conservative solution could not be generated for ~fEROSION.\n")
+        }
+
+        # PS
+        sol_p_neg_erosion <- tryCatch(
+             minimize(tt_neg_erosion, details = TRUE, method = "eQMC", include = "?", show.cases = TRUE),
+             error = function(e) { cat("Error minimizing (Parsimonious) for ~fEROSION:", e$message, "\n"); NULL }
+        )
+        if (!is.null(sol_p_neg_erosion)) {
+            cat("\n--- Parsimonious Solution (~fEROSION) ---\n")
+            print(sol_p_neg_erosion)
+        } else {
+            cat("Parsimonious solution could not be generated for ~fEROSION.\n")
+        }
+
+        # Intermediate Solution 
+        cat("\n--- Intermediate Solution (~fEROSION - Requires dir.exp) ---\n")
+        cat("To generate the Intermediate Solution, define directional expectations ('dir.exp') based on theory for the *absence* of erosion.\n")
+        cat("Example: dir_exp_neg_erosion <- c(fINST=\"1\", fGINI=\"0\", fPOL=\"0\", fJUDATTACK_comp=\"0\") # Expect absence of erosion with high INST, low GINI, POL, JUDATTACK\n")
+        cat("# Then run: minimize(tt_neg_erosion, details=TRUE, method=\"eQMC\", include=\"?\", dir.exp = dir_exp_neg_erosion, show.cases=TRUE)\n")
+
+    } else {
+        cat("Skipping minimization for ~fEROSION: Truth table is empty or could not be generated (check inclusion/N cuts and data variation).\n")
+    }
+}
+```
+
+## 5. Conclusion
+
+```{r final-summary}
+cat("--- Summary (Cross-Sectional, N=", nrow(qca_calibrated_data_cs_df), ") ---\n")
+cat("Outcome: fEROSION (Fuzzy membership in Democratic Erosion, based on LDI change 2000-02 vs 2018-20)\n")
+cat("Conditions:", paste(conditions_cs, collapse=", "), "\n\n")
+```
+
+**Guide:**
+
+1.  **Necessity analysis:** Examine the results printed under "Necessity Analysis for Outcome fEROSION" and "~fEROSION". Look for conditions (or their absence, indicated by lowercase letters) with high consistency (`Incl.`) scores (typically > 0.9) and potentially meaningful coverage (`Cov.`). A necessary condition must be present for the outcome to occur.
+2.  **Sufficiency analysis:**
+    *   **Truth table:** Review the truth tables for `fEROSION` and `~fEROSION`. These show the observed combinations of conditions (rows), the number of cases (`n`), the consistency (`incl`) of that configuration leading to the outcome, and the outcome value assigned (`OUT`). Configurations with `OUT=1` are used for minimisation.
+    *   **Solutions (Conservative & Parsimonious):** Examine the solution formulas produced by the `minimize` function for both `fEROSION` and `~fEROSION`.
+        *   Each line in the solution represents a *pathway* (a combination of conditions) sufficient for the outcome.
+        *   Uppercase letters indicate the *presence* of a condition; lowercase letters indicate its *absence*.
+        *   `*` represents 'AND'.
+        *   `+` represents 'OR' **operator** (separating different sufficient pathways).
+        *   Check the `inclS` (consistency) and `covS` (coverage) for each pathway, and the overall solution consistency (`sol.incl`) and coverage (`sol.cov`). High consistency (e.g., > 0.80 or 0.85) is desired for sufficiency. Coverage indicates the empirical relevance of a pathway or solution.
+        *   The Conservative solution uses only configurations with observed cases supporting the outcome. The Parsimonious solution also uses logical remainders (unobserved configurations) to simplify the formula, based on simplifying assumptions. The Intermediate solution (if generated using `dir.exp`) balances these, using only theoretically plausible remainders. Comparing these solutions helps assess the robustness of the findings.
